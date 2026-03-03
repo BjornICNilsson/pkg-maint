@@ -107,3 +107,7 @@ MIT. See `LICENSE`.
 ## Contributing
 
 See `CONTRIBUTING.md`.
+
+## Code of Conduct
+
+See `CODE_OF_CONDUCT.md`.
