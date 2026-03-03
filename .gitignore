@@ -1,0 +1,11 @@
+# Local logs and editor files
+*.log
+*.swp
+*~
+
+# OS and tooling noise
+.DS_Store
+.pytest_cache/
+
+# Local test artifacts
+/tmp/

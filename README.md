@@ -2,6 +2,10 @@
 
 Linux-native updater for non-APT global packages (`pip` + `uv tool` + `npm`) with an APT-style interactive confirmation flow.
 
+## Project Status
+
+`pkg-maint` is stable for small personal and workstation use. The project is intentionally small, shell-based, and conservative in scope.
+
 ## Features
 
 - Lists global outdated packages from `pip`, `uv tool`, and `npm`
@@ -95,3 +99,11 @@ LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/pkg-maint/history.log"
 
 - Script scope is global package installs only (`pip`, `uv tool`, and global `npm`).
 - If permissions are insufficient for a package install, the script records the failure and continues.
+
+## License
+
+MIT. See `LICENSE`.
+
+## Contributing
+
+See `CONTRIBUTING.md`.
