@@ -1,0 +1,650 @@
+#!/usr/bin/env sh
+
+set -u
+
+PROGRAM=${0##*/}
+TAB=$(printf '\t')
+
+CHECK_ONLY=0
+ASSUME_YES=0
+MANAGER="all"
+VERBOSE=0
+
+DEFAULT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/pkg-maint/config.env"
+CONFIG_FILE="$DEFAULT_CONFIG"
+
+PIP_EXCLUDE=""
+UV_EXCLUDE=""
+NPM_EXCLUDE=""
+PIP_CMD="python3 -m pip"
+UV_CMD="uv"
+NPM_CMD="npm"
+LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/pkg-maint/history.log"
+
+usage() {
+  cat <<USAGE
+Usage: $PROGRAM [options]
+
+Options:
+  --check                 List updates only; do not install
+  --yes                   Install without confirmation prompt
+  --manager <pip|uv|npm|all>  Limit scope to one manager (default: all)
+  --config <path>         Use a custom config file
+  --verbose               Print command output during installs
+  -h, --help              Show this help
+USAGE
+}
+
+warn() {
+  printf '%s: %s\n' "$PROGRAM" "$*" >&2
+}
+
+die() {
+  warn "$*"
+  exit 1
+}
+
+first_word() {
+  set -- $1
+  if [ "$#" -eq 0 ]; then
+    return 1
+  fi
+  printf '%s\n' "$1"
+}
+
+is_excluded() {
+  list=$1
+  item=$2
+  case " $list " in
+    *" $item "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+ensure_log_dir() {
+  log_dir=$(dirname "$LOG_FILE")
+  mkdir -p "$log_dir" 2>/dev/null || true
+}
+
+log_result() {
+  manager_name=$1
+  package_name=$2
+  old_version=$3
+  new_version=$4
+  result=$5
+
+  ensure_log_dir
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+    "$manager_name" \
+    "$package_name" \
+    "$old_version" \
+    "$new_version" \
+    "$result" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+pip_list_outdated() {
+  # shellcheck disable=SC2086
+  set -- $PIP_CMD
+  "$@" list --outdated --format=json
+}
+
+pip_install_pkg() {
+  package_name=$1
+  # shellcheck disable=SC2086
+  set -- $PIP_CMD
+  "$@" install --upgrade "$package_name"
+}
+
+npm_list_outdated() {
+  # shellcheck disable=SC2086
+  set -- $NPM_CMD
+  "$@" outdated -g --json
+}
+
+npm_install_pkg() {
+  package_name=$1
+  # shellcheck disable=SC2086
+  set -- $NPM_CMD
+  "$@" install -g "${package_name}@latest"
+}
+
+uv_list_tools() {
+  # shellcheck disable=SC2086
+  set -- $UV_CMD
+  "$@" tool list
+}
+
+uv_tool_dir() {
+  # shellcheck disable=SC2086
+  set -- $UV_CMD
+  "$@" tool dir
+}
+
+uv_install_pkg() {
+  package_name=$1
+  # shellcheck disable=SC2086
+  set -- $UV_CMD
+  "$@" tool upgrade "$package_name"
+}
+
+append_update() {
+  manager_name=$1
+  package_name=$2
+  current_version=$3
+  latest_version=$4
+  action=$5
+
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$manager_name" "$package_name" "$current_version" "$latest_version" "$action" >>"$ALL_UPDATES_FILE"
+
+  if [ "$action" = "update" ]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$manager_name" "$package_name" "$current_version" "$latest_version" "$action" >>"$TO_INSTALL_FILE"
+  fi
+}
+
+collect_pip_updates() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to parse pip update output"
+    return 1
+  fi
+
+  pip_json=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-pip.XXXXXX") || return 1
+  pip_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-pip-err.XXXXXX") || {
+    rm -f "$pip_json"
+    return 1
+  }
+  pip_parsed=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-pip-parsed.XXXXXX") || {
+    rm -f "$pip_json" "$pip_err"
+    return 1
+  }
+
+  if ! pip_list_outdated >"$pip_json" 2>"$pip_err"; then
+    warn "pip scan failed: $(tail -n 1 "$pip_err" 2>/dev/null)"
+    rm -f "$pip_json" "$pip_err" "$pip_parsed"
+    return 1
+  fi
+
+  if [ ! -s "$pip_json" ]; then
+    rm -f "$pip_json" "$pip_err" "$pip_parsed"
+    return 0
+  fi
+
+  if ! python3 - "$pip_json" >"$pip_parsed" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as fh:
+    raw = fh.read().strip()
+if not raw:
+    raise SystemExit(0)
+items = json.loads(raw)
+for item in items:
+    name = item.get('name', '')
+    current = item.get('version', '')
+    latest = item.get('latest_version', '')
+    if name:
+        print(f"{name}\t{current}\t{latest}")
+PY
+  then
+    warn "failed to parse pip update output"
+    rm -f "$pip_json" "$pip_err" "$pip_parsed"
+    return 1
+  fi
+
+  while IFS="$TAB" read -r package_name current_version latest_version; do
+    [ -n "${package_name:-}" ] || continue
+
+    action="update"
+    if is_excluded "$PIP_EXCLUDE" "$package_name"; then
+      action="held"
+    fi
+
+    append_update "pip" "$package_name" "${current_version:-unknown}" "${latest_version:-unknown}" "$action"
+  done <"$pip_parsed"
+
+  rm -f "$pip_json" "$pip_err" "$pip_parsed"
+  return 0
+}
+
+collect_uv_updates() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to parse uv update output"
+    return 1
+  fi
+
+  uv_list_file=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-list.XXXXXX") || return 1
+  uv_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-err.XXXXXX") || {
+    rm -f "$uv_list_file"
+    return 1
+  }
+
+  if ! uv_list_tools >"$uv_list_file" 2>"$uv_err"; then
+    warn "uv scan failed: $(tail -n 1 "$uv_err" 2>/dev/null)"
+    rm -f "$uv_list_file" "$uv_err"
+    return 1
+  fi
+
+  if grep -Fxq "No tools installed" "$uv_list_file"; then
+    rm -f "$uv_list_file" "$uv_err"
+    return 0
+  fi
+
+  if uv_root=$(uv_tool_dir 2>>"$uv_err"); then
+    :
+  else
+    warn "uv scan failed: $(tail -n 1 "$uv_err" 2>/dev/null)"
+    rm -f "$uv_list_file" "$uv_err"
+    return 1
+  fi
+
+  while IFS= read -r line; do
+    case "$line" in
+      ""|"No tools installed"|"$TAB"*|" "*)
+        continue
+        ;;
+    esac
+
+    set -- $line
+    tool_name=${1:-}
+    tool_name=${tool_name%:}
+    [ -n "$tool_name" ] || continue
+
+    tool_python="$uv_root/$tool_name/bin/python"
+    if [ ! -x "$tool_python" ]; then
+      warn "uv tool environment missing python: $tool_name"
+      continue
+    fi
+
+    uv_tool_json=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool.XXXXXX") || continue
+    uv_tool_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool-err.XXXXXX") || {
+      rm -f "$uv_tool_json"
+      continue
+    }
+    uv_tool_parsed=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool-parsed.XXXXXX") || {
+      rm -f "$uv_tool_json" "$uv_tool_err"
+      continue
+    }
+
+    if ! "$tool_python" -m pip list --outdated --format=json >"$uv_tool_json" 2>"$uv_tool_err"; then
+      warn "uv tool scan failed for $tool_name: $(tail -n 1 "$uv_tool_err" 2>/dev/null)"
+      rm -f "$uv_tool_json" "$uv_tool_err" "$uv_tool_parsed"
+      continue
+    fi
+
+    if ! python3 - "$uv_tool_json" "$tool_name" >"$uv_tool_parsed" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+tool_name = sys.argv[2]
+
+def normalize(name: str) -> str:
+    return name.lower().replace("_", "-")
+
+with open(path, 'r', encoding='utf-8') as fh:
+    raw = fh.read().strip()
+if not raw:
+    raise SystemExit(0)
+items = json.loads(raw)
+tool_name_norm = normalize(tool_name)
+for item in items:
+    name = item.get('name', '')
+    if normalize(name) != tool_name_norm:
+        continue
+    current = item.get('version', '')
+    latest = item.get('latest_version', '')
+    print(f"{name}\t{current}\t{latest}")
+    break
+PY
+    then
+      warn "failed to parse uv tool output for $tool_name"
+      rm -f "$uv_tool_json" "$uv_tool_err" "$uv_tool_parsed"
+      continue
+    fi
+
+    if [ -s "$uv_tool_parsed" ]; then
+      while IFS="$TAB" read -r package_name current_version latest_version; do
+        [ -n "${package_name:-}" ] || continue
+
+        action="update"
+        if is_excluded "$UV_EXCLUDE" "$package_name" || is_excluded "$UV_EXCLUDE" "$tool_name"; then
+          action="held"
+        fi
+
+        append_update "uv" "$package_name" "${current_version:-unknown}" "${latest_version:-unknown}" "$action"
+      done <"$uv_tool_parsed"
+    fi
+
+    rm -f "$uv_tool_json" "$uv_tool_err" "$uv_tool_parsed"
+  done <"$uv_list_file"
+
+  rm -f "$uv_list_file" "$uv_err"
+  return 0
+}
+
+collect_npm_updates() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    warn "python3 is required to parse npm update output"
+    return 1
+  fi
+
+  npm_json=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm.XXXXXX") || return 1
+  npm_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-err.XXXXXX") || {
+    rm -f "$npm_json"
+    return 1
+  }
+  npm_parsed=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-parsed.XXXXXX") || {
+    rm -f "$npm_json" "$npm_err"
+    return 1
+  }
+
+  if npm_list_outdated >"$npm_json" 2>"$npm_err"; then
+    npm_status=0
+  else
+    npm_status=$?
+  fi
+
+  if [ "$npm_status" -gt 1 ]; then
+    warn "npm scan failed: $(tail -n 1 "$npm_err" 2>/dev/null)"
+    rm -f "$npm_json" "$npm_err" "$npm_parsed"
+    return 1
+  fi
+
+  if [ ! -s "$npm_json" ]; then
+    rm -f "$npm_json" "$npm_err" "$npm_parsed"
+    return 0
+  fi
+
+  if ! python3 - "$npm_json" >"$npm_parsed" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, 'r', encoding='utf-8') as fh:
+    raw = fh.read().strip()
+if not raw:
+    raise SystemExit(0)
+obj = json.loads(raw)
+if not isinstance(obj, dict):
+    raise SystemExit(0)
+for name, meta in obj.items():
+    if not isinstance(meta, dict):
+        continue
+    current = str(meta.get('current', ''))
+    latest = str(meta.get('latest', ''))
+    print(f"{name}\t{current}\t{latest}")
+PY
+  then
+    warn "failed to parse npm update output"
+    rm -f "$npm_json" "$npm_err" "$npm_parsed"
+    return 1
+  fi
+
+  while IFS="$TAB" read -r package_name current_version latest_version; do
+    [ -n "${package_name:-}" ] || continue
+
+    action="update"
+    if is_excluded "$NPM_EXCLUDE" "$package_name"; then
+      action="held"
+    fi
+
+    append_update "npm" "$package_name" "${current_version:-unknown}" "${latest_version:-unknown}" "$action"
+  done <"$npm_parsed"
+
+  rm -f "$npm_json" "$npm_err" "$npm_parsed"
+  return 0
+}
+
+print_table() {
+  printf '%-8s %-30s %-16s %-16s %-8s\n' "manager" "package" "current" "latest" "action"
+  printf '%-8s %-30s %-16s %-16s %-8s\n' "-------" "------------------------------" "----------------" "----------------" "------"
+
+  while IFS="$TAB" read -r manager_name package_name current_version latest_version action; do
+    printf '%-8s %-30s %-16s %-16s %-8s\n' \
+      "$manager_name" "$package_name" "$current_version" "$latest_version" "$action"
+  done <"$ALL_UPDATES_FILE"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)
+      CHECK_ONLY=1
+      ;;
+    --yes)
+      ASSUME_YES=1
+      ;;
+    --manager)
+      [ "$#" -ge 2 ] || die "--manager requires a value"
+      case "$2" in
+        pip|uv|npm|all)
+          MANAGER="$2"
+          ;;
+        *)
+          die "invalid --manager value: $2"
+          ;;
+      esac
+      shift
+      ;;
+    --config)
+      [ "$#" -ge 2 ] || die "--config requires a path"
+      CONFIG_FILE="$2"
+      shift
+      ;;
+    --verbose)
+      VERBOSE=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      die "unknown option: $1"
+      ;;
+  esac
+  shift
+done
+
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+fi
+
+ALL_UPDATES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-all.XXXXXX") || die "unable to create temp file"
+TO_INSTALL_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-install.XXXXXX") || die "unable to create temp file"
+FAILURES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-failures.XXXXXX") || die "unable to create temp file"
+
+cleanup() {
+  rm -f "$ALL_UPDATES_FILE" "$TO_INSTALL_FILE" "$FAILURES_FILE"
+}
+trap cleanup EXIT INT TERM
+
+want_pip=0
+want_uv=0
+want_npm=0
+case "$MANAGER" in
+  all)
+    want_pip=1
+    want_uv=1
+    want_npm=1
+    ;;
+  pip)
+    want_pip=1
+    ;;
+  uv)
+    want_uv=1
+    ;;
+  npm)
+    want_npm=1
+    ;;
+esac
+
+available_managers=0
+runtime_error=0
+
+if [ "$want_pip" -eq 1 ]; then
+  pip_bin=$(first_word "$PIP_CMD" || true)
+  if [ -n "$pip_bin" ] && command -v "$pip_bin" >/dev/null 2>&1; then
+    available_managers=$((available_managers + 1))
+    if ! collect_pip_updates; then
+      runtime_error=1
+    fi
+  else
+    warn "pip manager unavailable (missing command: $pip_bin)"
+  fi
+fi
+
+if [ "$want_uv" -eq 1 ]; then
+  uv_bin=$(first_word "$UV_CMD" || true)
+  if [ -n "$uv_bin" ] && command -v "$uv_bin" >/dev/null 2>&1; then
+    available_managers=$((available_managers + 1))
+    if ! collect_uv_updates; then
+      runtime_error=1
+    fi
+  else
+    warn "uv manager unavailable (missing command: $uv_bin)"
+  fi
+fi
+
+if [ "$want_npm" -eq 1 ]; then
+  npm_bin=$(first_word "$NPM_CMD" || true)
+  if [ -n "$npm_bin" ] && command -v "$npm_bin" >/dev/null 2>&1; then
+    available_managers=$((available_managers + 1))
+    if ! collect_npm_updates; then
+      runtime_error=1
+    fi
+  else
+    warn "npm manager unavailable (missing command: $npm_bin)"
+  fi
+fi
+
+if [ "$available_managers" -eq 0 ]; then
+  die "no selected package managers are available"
+fi
+
+total_count=$(wc -l <"$ALL_UPDATES_FILE" | tr -d ' ')
+hold_count=$(awk -F '\t' '$5 == "held" { c += 1 } END { print c + 0 }' "$ALL_UPDATES_FILE")
+install_count=$(wc -l <"$TO_INSTALL_FILE" | tr -d ' ')
+
+if [ "$total_count" -eq 0 ]; then
+  printf 'No updates found for selected manager(s).\n'
+  if [ "$runtime_error" -eq 1 ]; then
+    exit 1
+  fi
+  exit 0
+fi
+
+print_table
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  printf '\nSummary: scanned=%s updatable=%s held=%s\n' "$total_count" "$install_count" "$hold_count"
+
+  if [ "$runtime_error" -eq 1 ]; then
+    exit 1
+  fi
+  if [ "$install_count" -gt 0 ]; then
+    exit 2
+  fi
+  exit 0
+fi
+
+if [ "$install_count" -eq 0 ]; then
+  printf '\nNo installable updates (all updates are held).\n'
+  if [ "$runtime_error" -eq 1 ]; then
+    exit 1
+  fi
+  exit 0
+fi
+
+if [ "$ASSUME_YES" -ne 1 ]; then
+  printf '\nProceed with install? [y/N] '
+  read -r answer || answer=""
+  case "$answer" in
+    y|Y|yes|YES)
+      ;;
+    *)
+      printf 'Aborted.\n'
+      exit 0
+      ;;
+  esac
+fi
+
+updated_count=0
+failed_count=0
+
+while IFS="$TAB" read -r manager_name package_name current_version latest_version action; do
+  [ "$action" = "update" ] || continue
+
+  install_log=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-install-log.XXXXXX") || {
+    warn "unable to create install log temp file"
+    failed_count=$((failed_count + 1))
+    continue
+  }
+
+  printf 'Installing %s (%s -> %s) via %s...\n' "$package_name" "$current_version" "$latest_version" "$manager_name"
+
+  if [ "$manager_name" = "pip" ]; then
+    if pip_install_pkg "$package_name" >"$install_log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  elif [ "$manager_name" = "uv" ]; then
+    if uv_install_pkg "$package_name" >"$install_log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  else
+    if npm_install_pkg "$package_name" >"$install_log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    updated_count=$((updated_count + 1))
+    log_result "$manager_name" "$package_name" "$current_version" "$latest_version" "ok"
+    if [ "$VERBOSE" -eq 1 ]; then
+      sed 's/^/  /' "$install_log"
+    fi
+  else
+    failed_count=$((failed_count + 1))
+    failure_reason="install failed"
+    if grep -Eiq 'permission denied|EACCES|operation not permitted|not permitted' "$install_log"; then
+      failure_reason="permission denied"
+    fi
+
+    warn "failed to install $manager_name/$package_name: $failure_reason"
+    if [ "$VERBOSE" -eq 1 ]; then
+      sed 's/^/  /' "$install_log" >&2
+    fi
+
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$manager_name" "$package_name" "$current_version" "$latest_version" "$failure_reason" >>"$FAILURES_FILE"
+
+    log_result "$manager_name" "$package_name" "$current_version" "$latest_version" "failed:$failure_reason"
+  fi
+
+  rm -f "$install_log"
+done <"$TO_INSTALL_FILE"
+
+printf '\nSummary: scanned=%s updatable=%s held=%s updated=%s failed=%s\n' \
+  "$total_count" "$install_count" "$hold_count" "$updated_count" "$failed_count"
+
+if [ "$failed_count" -gt 0 ]; then
+  printf 'Failures:\n'
+  while IFS="$TAB" read -r manager_name package_name current_version latest_version failure_reason; do
+    printf '  %s/%s (%s -> %s): %s\n' \
+      "$manager_name" "$package_name" "$current_version" "$latest_version" "$failure_reason"
+  done <"$FAILURES_FILE"
+fi
+
+if [ "$runtime_error" -eq 1 ] || [ "$failed_count" -gt 0 ]; then
+  exit 1
+fi
+
+exit 0

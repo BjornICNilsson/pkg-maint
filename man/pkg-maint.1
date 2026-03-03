@@ -1,0 +1,78 @@
+.TH PKG-MAINT 1 "February 2026" "pkg-maint" "User Commands"
+.SH NAME
+pkg-maint \- update global pip, uv tool, and npm packages with an interactive Linux-native flow
+.SH SYNOPSIS
+.B pkg-maint
+.RI [ --check ]
+.RI [ --yes ]
+.RI [ --manager " pip|uv|npm|all" ]
+.RI [ --config " path" ]
+.RI [ --verbose ]
+.SH DESCRIPTION
+.B pkg-maint
+lists available updates for global pip, uv tool, and npm packages, then asks for confirmation before installing.
+It supports a non-interactive mode with
+.BR --yes .
+.SH OPTIONS
+.TP
+.B --check
+List outdated packages only. Do not install.
+Returns exit code 2 when installable updates are available.
+.TP
+.B --yes
+Skip confirmation prompt and install updates directly.
+.TP
+.BI "--manager " pip|uv|npm|all
+Limit operations to a specific manager. Default is
+.B all.
+.TP
+.BI "--config " path
+Load a specific config file. Default is
+.I ~/.config/pkg-maint/config.env.
+.TP
+.B --verbose
+Print manager command output during installation.
+.TP
+.BR -h , " --help"
+Show usage help.
+.SH CONFIGURATION
+Configuration file variables:
+.IP \[bu] 2
+.B PIP_EXCLUDE
+(space-separated names)
+.IP \[bu] 2
+.B UV_EXCLUDE
+(space-separated names)
+.IP \[bu] 2
+.B NPM_EXCLUDE
+(space-separated names)
+.IP \[bu] 2
+.B PIP_CMD
+(default:
+.BR "python3 -m pip" )
+.IP \[bu] 2
+.B UV_CMD
+(default:
+.BR uv )
+.IP \[bu] 2
+.B NPM_CMD
+(default:
+.BR npm )
+.IP \[bu] 2
+.B LOG_FILE
+(default:
+.BR ~/.local/state/pkg-maint/history.log )
+.SH EXIT STATUS
+.IP \[bu] 2
+0: success, or nothing to update
+.IP \[bu] 2
+1: runtime failure or package install failure
+.IP \[bu] 2
+2: updates available in
+.B --check
+mode
+.SH FILES
+.IP \[bu] 2
+.I ~/.config/pkg-maint/config.env
+.IP \[bu] 2
+.I ~/.local/state/pkg-maint/history.log
