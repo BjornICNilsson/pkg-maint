@@ -9,6 +9,8 @@ CHECK_ONLY=0
 ASSUME_YES=0
 MANAGER="all"
 VERBOSE=0
+MIGRATE_NVM=0
+MIGRATE_NVM_FROM=""
 
 RUN_ID="$(date '+%Y%m%dT%H%M%S%z')-$$"
 RUN_STARTED=0
@@ -21,6 +23,12 @@ NPM_PACKAGE_COUNT="unknown"
 NPM_OUTDATED_COUNT=0
 NPM_ACTIVE_PREFIX="unknown"
 NVM_INACTIVE_PREFIX_COUNT=0
+NPM_ENV_INSPECTED=0
+
+MIGRATION_SOURCE=""
+MIGRATION_PACKAGE_COUNT=0
+MIGRATION_MIGRATED_COUNT=0
+MIGRATION_FAILED_COUNT=0
 
 total_count=0
 hold_count=0
@@ -49,6 +57,8 @@ Options:
   --check                 List updates only; do not install
   --yes                   Install without confirmation prompt
   --manager <pip|uv|npm|all>  Limit scope to one manager (default: all)
+  --migrate-nvm           Migrate missing packages from an inactive NVM version
+  --migrate-nvm-from <version>  Select a specific inactive NVM source version
   --config <path>         Use a custom config file
   --verbose               Print scan details and install command output
   -h, --help              Show this help
@@ -166,6 +176,13 @@ npm_install_pkg() {
   "$@" install -g "${package_name}@latest"
 }
 
+npm_install_spec() {
+  package_spec=$1
+  # shellcheck disable=SC2086
+  set -- $NPM_CMD
+  "$@" install -g "$package_spec"
+}
+
 npm_active_prefix() {
   # shellcheck disable=SC2086
   set -- $NPM_CMD
@@ -173,6 +190,15 @@ npm_active_prefix() {
 }
 
 inspect_npm_environment() {
+  if [ "$NPM_ENV_INSPECTED" -eq 1 ]; then
+    return 0
+  fi
+  NPM_ENV_INSPECTED=1
+  NVM_INACTIVE_PREFIX_COUNT=0
+  if [ -n "${NVM_MIGRATION_FILE:-}" ]; then
+    : >"$NVM_MIGRATION_FILE"
+  fi
+
   npm_prefix_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-prefix-err.XXXXXX") || return 0
   npm_environment=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-environment.XXXXXX") || {
     rm -f "$npm_prefix_err"
@@ -199,11 +225,11 @@ active_prefix = pathlib.Path(sys.argv[1]).expanduser()
 nvm_root = pathlib.Path(sys.argv[2]).expanduser()
 
 
-def package_names(prefix):
+def packages(prefix):
     root = prefix / "lib" / "node_modules"
-    names = set()
+    found = {}
     if not root.is_dir():
-        return names
+        return found
     for entry in root.iterdir():
         if entry.name.startswith("@") and entry.is_dir():
             candidates = entry.iterdir()
@@ -218,12 +244,15 @@ def package_names(prefix):
             except (OSError, json.JSONDecodeError):
                 continue
             name = data.get("name")
-            if isinstance(name, str) and name:
-                names.add(name)
-    return names
+            version = data.get("version")
+            if isinstance(name, str) and name and isinstance(version, str) and version:
+                kind = "linked" if candidate.is_symlink() else "registry"
+                found[name] = (version, kind)
+    return found
 
 
-active_names = package_names(active_prefix)
+active_packages = packages(active_prefix)
+active_names = set(active_packages)
 print(f"ACTIVE\t{len(active_names)}")
 
 versions_dir = nvm_root / "versions" / "node"
@@ -242,9 +271,13 @@ if versions_dir.is_dir():
         except OSError:
             if prefix == active_prefix:
                 continue
-        extra_names = sorted(package_names(prefix) - active_names)
+        source_packages = packages(prefix)
+        extra_names = sorted(set(source_packages) - active_names)
         if extra_names:
             print(f"INACTIVE\t{prefix.name}\t{','.join(extra_names)}")
+            for name in extra_names:
+                version, kind = source_packages[name]
+                print(f"PACKAGE\t{prefix.name}\t{prefix}\t{name}\t{version}\t{kind}")
 PY
   then
     verbose "unable to inspect npm/NVM package directories"
@@ -252,15 +285,20 @@ PY
     return 0
   fi
 
-  while IFS="$TAB" read -r record_type record_value record_packages; do
+  while IFS="$TAB" read -r record_type field1 field2 field3 field4 field5; do
     case "$record_type" in
       ACTIVE)
-        NPM_PACKAGE_COUNT=${record_value:-unknown}
+        NPM_PACKAGE_COUNT=${field1:-unknown}
         ;;
       INACTIVE)
         NVM_INACTIVE_PREFIX_COUNT=$((NVM_INACTIVE_PREFIX_COUNT + 1))
-        warn "inactive NVM prefix $record_value contains packages absent from active prefix: $record_packages"
-        log_event "scan" "npm" "run=$RUN_ID inactive_nvm_prefix=$record_value packages=$record_packages"
+        warn "inactive NVM prefix $field1 contains packages absent from active prefix: $field2"
+        log_event "scan" "npm" "run=$RUN_ID inactive_nvm_prefix=$field1 packages=$field2"
+        ;;
+      PACKAGE)
+        if [ -n "${NVM_MIGRATION_FILE:-}" ]; then
+          printf '%s\t%s\t%s\t%s\t%s\n' "$field1" "$field2" "$field3" "$field4" "$field5" >>"$NVM_MIGRATION_FILE"
+        fi
         ;;
     esac
   done <"$npm_environment"
@@ -268,6 +306,206 @@ PY
   verbose "npm active prefix: $NPM_ACTIVE_PREFIX (global packages=$NPM_PACKAGE_COUNT)"
   verbose_file "$npm_prefix_err"
   rm -f "$npm_prefix_err" "$npm_environment"
+}
+
+print_migration_sources() {
+  source_number=0
+  while IFS="$TAB" read -r source_version source_prefix; do
+    source_number=$((source_number + 1))
+    source_count=$(awk -F '\t' -v source="$source_version" '$1 == source { count += 1 } END { print count + 0 }' "$NVM_MIGRATION_FILE")
+    printf '  %s) %s (%s packages)\n' "$source_number" "$source_version" "$source_count"
+  done <"$NVM_SOURCES_FILE"
+}
+
+select_migration_source() {
+  awk -F '\t' '!seen[$1]++ { print $1 "\t" $2 }' "$NVM_MIGRATION_FILE" | sort >"$NVM_SOURCES_FILE"
+  source_count=$(wc -l <"$NVM_SOURCES_FILE" | tr -d ' ')
+
+  if [ "$source_count" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ -n "$MIGRATE_NVM_FROM" ]; then
+    requested_source=$MIGRATE_NVM_FROM
+    case "$requested_source" in
+      v*) alternate_source=${requested_source#v} ;;
+      *) alternate_source="v$requested_source" ;;
+    esac
+    MIGRATION_SOURCE=$(awk -F '\t' -v first="$requested_source" -v second="$alternate_source" '$1 == first || $1 == second { print $1; exit }' "$NVM_SOURCES_FILE")
+    if [ -z "$MIGRATION_SOURCE" ]; then
+      warn "requested NVM source not found or has no packages to migrate: $MIGRATE_NVM_FROM"
+      return 1
+    fi
+    return 0
+  fi
+
+  if [ "$source_count" -eq 1 ]; then
+    IFS="$TAB" read -r MIGRATION_SOURCE ignored_prefix <"$NVM_SOURCES_FILE"
+    return 0
+  fi
+
+  printf 'Multiple inactive NVM environments contain migratable packages:\n'
+  print_migration_sources
+
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    MIGRATION_PACKAGE_COUNT=$(wc -l <"$NVM_MIGRATION_FILE" | tr -d ' ')
+    printf 'Use --migrate-nvm-from <version> to preview one source.\n'
+    return 2
+  fi
+
+  if [ "$ASSUME_YES" -eq 1 ]; then
+    warn "multiple NVM sources require --migrate-nvm-from when using --yes"
+    return 1
+  fi
+
+  printf 'Select source [1-%s, q to cancel]: ' "$source_count"
+  read -r source_answer || source_answer="q"
+  case "$source_answer" in
+    q|Q|"")
+      return 3
+      ;;
+    *[!0-9]*)
+      warn "invalid migration source selection: $source_answer"
+      return 1
+      ;;
+  esac
+  if [ "$source_answer" -lt 1 ] || [ "$source_answer" -gt "$source_count" ]; then
+    warn "migration source selection out of range: $source_answer"
+    return 1
+  fi
+
+  selected_source_line=$(sed -n "${source_answer}p" "$NVM_SOURCES_FILE")
+  MIGRATION_SOURCE=${selected_source_line%%"$TAB"*}
+  return 0
+}
+
+print_migration_preview() {
+  MIGRATION_PACKAGE_COUNT=$(awk -F '\t' -v source="$MIGRATION_SOURCE" '$1 == source { count += 1 } END { print count + 0 }' "$NVM_MIGRATION_FILE")
+  printf 'NVM package migration preview\n'
+  printf '  Source: %s\n' "$MIGRATION_SOURCE"
+  printf '  Active target: %s\n' "$NPM_ACTIVE_PREFIX"
+  printf '  Packages:\n'
+  while IFS="$TAB" read -r source_version source_prefix package_name package_version package_kind; do
+    [ "$source_version" = "$MIGRATION_SOURCE" ] || continue
+    if [ "$package_kind" = "linked" ]; then
+      printf '    %-36s %-16s %s\n' "$package_name" "$package_version" "linked (unsupported)"
+    else
+      printf '    %-36s %s\n' "$package_name" "$package_version"
+    fi
+  done <"$NVM_MIGRATION_FILE"
+}
+
+verify_migrated_package() {
+  verify_name=$1
+  verify_version=$2
+  python3 - "$NPM_ACTIVE_PREFIX" "$verify_name" "$verify_version" <<'PY'
+import json
+import pathlib
+import sys
+
+prefix = pathlib.Path(sys.argv[1])
+name = sys.argv[2]
+expected = sys.argv[3]
+package_json = prefix / "lib" / "node_modules" / name / "package.json"
+try:
+    actual = json.loads(package_json.read_text(encoding="utf-8")).get("version")
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+raise SystemExit(0 if actual == expected else 1)
+PY
+}
+
+perform_nvm_migration() {
+  if awk -F '\t' -v source="$MIGRATION_SOURCE" '$1 == source && $5 == "linked" { found = 1 } END { exit found ? 0 : 1 }' "$NVM_MIGRATION_FILE"; then
+    warn "source $MIGRATION_SOURCE contains linked global packages; automatic migration is not supported"
+    return 1
+  fi
+
+  while IFS="$TAB" read -r source_version source_prefix package_name package_version package_kind; do
+    [ "$source_version" = "$MIGRATION_SOURCE" ] || continue
+    migration_log=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-migration-log.XXXXXX") || {
+      warn "unable to create migration log for $package_name"
+      MIGRATION_FAILED_COUNT=$((MIGRATION_FAILED_COUNT + 1))
+      continue
+    }
+    package_spec="$package_name@$package_version"
+    printf 'Migrating %s (%s) to active npm prefix...\n' "$package_name" "$package_version"
+    if npm_install_spec "$package_spec" >"$migration_log" 2>&1 && verify_migrated_package "$package_name" "$package_version"; then
+      MIGRATION_MIGRATED_COUNT=$((MIGRATION_MIGRATED_COUNT + 1))
+      log_result "migration" "$package_name" "$source_version" "$package_version" "ok run=$RUN_ID target=$NPM_ACTIVE_PREFIX"
+      verbose_file "$migration_log"
+    else
+      MIGRATION_FAILED_COUNT=$((MIGRATION_FAILED_COUNT + 1))
+      warn "failed to migrate $package_name from $source_version"
+      verbose_file "$migration_log"
+      log_result "migration" "$package_name" "$source_version" "$package_version" "failed run=$RUN_ID target=$NPM_ACTIVE_PREFIX"
+    fi
+    rm -f "$migration_log"
+  done <"$NVM_MIGRATION_FILE"
+
+  printf 'Migration summary: requested=%s migrated=%s failed=%s\n' \
+    "$MIGRATION_PACKAGE_COUNT" "$MIGRATION_MIGRATED_COUNT" "$MIGRATION_FAILED_COUNT"
+
+  if [ "$MIGRATION_FAILED_COUNT" -gt 0 ]; then
+    return 1
+  fi
+
+  NPM_ENV_INSPECTED=0
+  NPM_PACKAGE_COUNT="unknown"
+  NVM_INACTIVE_PREFIX_COUNT=0
+  : >"$NVM_MIGRATION_FILE"
+  log_event "migration" "$MIGRATION_SOURCE" "run=$RUN_ID status=complete migrated=$MIGRATION_MIGRATED_COUNT target=$NPM_ACTIVE_PREFIX"
+  return 0
+}
+
+run_nvm_migration() {
+  inspect_npm_environment
+  if [ "$NPM_ACTIVE_PREFIX" = "unknown" ]; then
+    warn "unable to migrate without an active npm prefix"
+    return 1
+  fi
+  nvm_root=${NVM_DIR:-$HOME/.nvm}
+  case "$NPM_ACTIVE_PREFIX" in
+    "$nvm_root"/versions/node/*) ;;
+    *)
+      warn "active npm prefix is not managed by NVM: $NPM_ACTIVE_PREFIX"
+      return 1
+      ;;
+  esac
+
+  if [ ! -s "$NVM_MIGRATION_FILE" ]; then
+    printf 'No packages found to migrate from inactive NVM environments.\n'
+    log_event "migration" "none" "run=$RUN_ID status=nothing-to-migrate target=$NPM_ACTIVE_PREFIX"
+    return 0
+  fi
+
+  if select_migration_source; then
+    selection_status=0
+  else
+    selection_status=$?
+  fi
+  case "$selection_status" in
+    1) return 1 ;;
+    2) return 2 ;;
+    3) return 3 ;;
+  esac
+
+  print_migration_preview
+  log_event "migration" "$MIGRATION_SOURCE" "run=$RUN_ID status=preview packages=$MIGRATION_PACKAGE_COUNT target=$NPM_ACTIVE_PREFIX"
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    return 2
+  fi
+
+  if [ "$ASSUME_YES" -ne 1 ]; then
+    printf 'Migrate these %s packages? [y/N] ' "$MIGRATION_PACKAGE_COUNT"
+    read -r migration_answer || migration_answer=""
+    case "$migration_answer" in
+      y|Y|yes|YES) ;;
+      *) return 3 ;;
+    esac
+  fi
+
+  perform_nvm_migration
 }
 
 uv_list_tools() {
@@ -639,6 +877,15 @@ while [ "$#" -gt 0 ]; do
       esac
       shift
       ;;
+    --migrate-nvm)
+      MIGRATE_NVM=1
+      ;;
+    --migrate-nvm-from)
+      [ "$#" -ge 2 ] || die "--migrate-nvm-from requires a version"
+      MIGRATE_NVM=1
+      MIGRATE_NVM_FROM="$2"
+      shift
+      ;;
     --config)
       [ "$#" -ge 2 ] || die "--config requires a path"
       CONFIG_FILE="$2"
@@ -663,21 +910,32 @@ if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
 fi
 
+if [ "$MIGRATE_NVM" -eq 1 ]; then
+  case "$MANAGER" in
+    all|npm) ;;
+    *) die "NVM migration requires --manager npm or --manager all" ;;
+  esac
+fi
+
 ALL_UPDATES_FILE=""
 TO_INSTALL_FILE=""
 FAILURES_FILE=""
+NVM_MIGRATION_FILE=""
+NVM_SOURCES_FILE=""
 
 cleanup() {
   [ -n "$ALL_UPDATES_FILE" ] && rm -f "$ALL_UPDATES_FILE"
   [ -n "$TO_INSTALL_FILE" ] && rm -f "$TO_INSTALL_FILE"
   [ -n "$FAILURES_FILE" ] && rm -f "$FAILURES_FILE"
+  [ -n "$NVM_MIGRATION_FILE" ] && rm -f "$NVM_MIGRATION_FILE"
+  [ -n "$NVM_SOURCES_FILE" ] && rm -f "$NVM_SOURCES_FILE"
 }
 
 finalize_run() {
   final_rc=$?
   trap - EXIT
   if [ "$RUN_STARTED" -eq 1 ]; then
-    log_event "run" "$RUN_ID" "finish outcome=$RUN_OUTCOME rc=$final_rc manager=$MANAGER found=$total_count updatable=$install_count held=$hold_count updated=$updated_count failed=$failed_count scan_errors=$runtime_error"
+    log_event "run" "$RUN_ID" "finish outcome=$RUN_OUTCOME rc=$final_rc manager=$MANAGER found=$total_count updatable=$install_count held=$hold_count updated=$updated_count failed=$failed_count scan_errors=$runtime_error migration_requested=$MIGRATION_PACKAGE_COUNT migrated=$MIGRATION_MIGRATED_COUNT migration_failed=$MIGRATION_FAILED_COUNT"
   fi
   cleanup
   exit "$final_rc"
@@ -690,12 +948,49 @@ run_mode="install"
 if [ "$CHECK_ONLY" -eq 1 ]; then
   run_mode="check"
 fi
+if [ "$MIGRATE_NVM" -eq 1 ]; then
+  run_mode="migrate"
+  if [ "$CHECK_ONLY" -eq 1 ]; then
+    run_mode="migrate-check"
+  fi
+fi
 RUN_STARTED=1
 log_event "run" "$RUN_ID" "start mode=$run_mode manager=$MANAGER"
 
 ALL_UPDATES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-all.XXXXXX") || die "unable to create temp file"
 TO_INSTALL_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-install.XXXXXX") || die "unable to create temp file"
 FAILURES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-failures.XXXXXX") || die "unable to create temp file"
+NVM_MIGRATION_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-nvm-migration.XXXXXX") || die "unable to create temp file"
+NVM_SOURCES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-nvm-sources.XXXXXX") || die "unable to create temp file"
+
+if [ "$MIGRATE_NVM" -eq 1 ]; then
+  npm_bin=$(first_word "$NPM_CMD" || true)
+  if [ -z "$npm_bin" ] || ! command -v "$npm_bin" >/dev/null 2>&1; then
+    RUN_OUTCOME="migration-failed"
+    die "npm manager unavailable for NVM migration (missing command: $npm_bin)"
+  fi
+  if run_nvm_migration; then
+    migration_status=0
+  else
+    migration_status=$?
+  fi
+  case "$migration_status" in
+    0) ;;
+    2)
+      RUN_OUTCOME="migration-available"
+      exit 2
+      ;;
+    3)
+      printf 'Migration aborted.\n'
+      RUN_OUTCOME="aborted"
+      exit 0
+      ;;
+    *)
+      RUN_OUTCOME="migration-failed"
+      exit 1
+      ;;
+  esac
+fi
 
 want_pip=0
 want_uv=0

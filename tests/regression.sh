@@ -56,6 +56,8 @@ test_help_and_syntax() {
 
   assert_status "$status" 0 "help exits successfully"
   assert_contains "$output" "<pip|uv|npm|all>" "help advertises uv manager"
+  assert_contains "$output" "--migrate-nvm" "help advertises automatic NVM migration"
+  assert_contains "$output" "--migrate-nvm-from" "help advertises explicit NVM source selection"
 }
 
 test_pip_npm_check_mode() {
@@ -431,6 +433,154 @@ EOF
   trap - EXIT INT TERM
 }
 
+test_nvm_migration_preview_and_install() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pkg-maint-test-migrate.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  active_prefix="$tmpdir/nvm/versions/node/v2"
+  inactive_prefix="$tmpdir/nvm/versions/node/v1"
+  mkdir -p \
+    "$active_prefix/lib/node_modules/npm" \
+    "$inactive_prefix/lib/node_modules/npm" \
+    "$inactive_prefix/lib/node_modules/@openai/codex"
+  printf '{"name":"npm","version":"2.0.0"}\n' >"$active_prefix/lib/node_modules/npm/package.json"
+  printf '{"name":"npm","version":"1.0.0"}\n' >"$inactive_prefix/lib/node_modules/npm/package.json"
+  printf '{"name":"@openai/codex","version":"0.1.0"}\n' >"$inactive_prefix/lib/node_modules/@openai/codex/package.json"
+
+  cat >"$tmpdir/fakenpm" <<EOF
+#!/usr/bin/env sh
+if [ "\$1 \$2 \$3" = "config get prefix" ]; then
+  printf '%s\n' "$active_prefix"
+  exit 0
+fi
+if [ "\$1" = "outdated" ]; then
+  printf '{}\n'
+  exit 0
+fi
+if [ "\$1 \$2" = "install -g" ]; then
+  spec=\$3
+  name=\${spec%@*}
+  version=\${spec##*@}
+  mkdir -p "$active_prefix/lib/node_modules/\$name"
+  printf '{"name":"%s","version":"%s"}\n' "\$name" "\$version" >"$active_prefix/lib/node_modules/\$name/package.json"
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$tmpdir/fakenpm"
+
+  cat >"$tmpdir/config.env" <<EOF
+NVM_DIR="$tmpdir/nvm"
+NPM_CMD="$tmpdir/fakenpm"
+PIP_CMD="pkg-maint-migration-missing-pip"
+UV_CMD="pkg-maint-migration-missing-uv"
+LOG_FILE="$tmpdir/history.log"
+EOF
+
+  preview_output="$tmpdir/preview.txt"
+  if run_pkg_maint "$preview_output" --migrate-nvm --check --manager npm --config "$tmpdir/config.env"; then
+    preview_status=0
+  else
+    preview_status=$?
+  fi
+  preview=$(cat "$preview_output")
+
+  assert_status "$preview_status" 2 "migration preview reports available action"
+  assert_contains "$preview" "NVM package migration preview" "migration preview is shown"
+  assert_contains "$preview" "Source: v1" "single source is selected automatically"
+  assert_contains "$preview" "Active target: $active_prefix" "active target is shown"
+  assert_contains "$preview" "@openai/codex" "migration package is listed"
+  if [ -e "$active_prefix/lib/node_modules/@openai/codex/package.json" ]; then
+    fail "migration preview modified the active prefix"
+  fi
+
+  migrate_output="$tmpdir/migrate.txt"
+  if run_pkg_maint "$migrate_output" --migrate-nvm --yes --manager npm --config "$tmpdir/config.env"; then
+    migrate_status=0
+  else
+    migrate_status=$?
+  fi
+  migrated=$(cat "$migrate_output")
+  history=$(cat "$tmpdir/history.log")
+  tab_char=$(printf '\t')
+
+  assert_status "$migrate_status" 0 "automatic migration succeeds for one source"
+  assert_contains "$migrated" "Migrating @openai/codex (0.1.0)" "migration action is shown"
+  assert_contains "$migrated" "requested=1 migrated=1 failed=0" "migration summary is accurate"
+  assert_contains "$history" "status=preview packages=1" "history records migration preview"
+  assert_contains "$history" "migration${tab_char}@openai/codex${tab_char}v1${tab_char}0.1.0${tab_char}ok" "history records migrated package"
+  assert_contains "$history" "status=complete migrated=1" "history records migration completion"
+  if [ ! -e "$active_prefix/lib/node_modules/@openai/codex/package.json" ]; then
+    fail "migrated package is missing from active prefix"
+  fi
+  if [ ! -e "$inactive_prefix/lib/node_modules/@openai/codex/package.json" ]; then
+    fail "source package was removed during migration"
+  fi
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+}
+
+test_nvm_migration_yes_rejects_ambiguous_sources() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pkg-maint-test-migrate-many.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  active_prefix="$tmpdir/nvm/versions/node/v3"
+  mkdir -p \
+    "$active_prefix/lib/node_modules/npm" \
+    "$tmpdir/nvm/versions/node/v1/lib/node_modules/alpha" \
+    "$tmpdir/nvm/versions/node/v2/lib/node_modules/beta"
+  printf '{"name":"npm","version":"3.0.0"}\n' >"$active_prefix/lib/node_modules/npm/package.json"
+  printf '{"name":"alpha","version":"1.0.0"}\n' >"$tmpdir/nvm/versions/node/v1/lib/node_modules/alpha/package.json"
+  printf '{"name":"beta","version":"2.0.0"}\n' >"$tmpdir/nvm/versions/node/v2/lib/node_modules/beta/package.json"
+
+  cat >"$tmpdir/fakenpm" <<EOF
+#!/usr/bin/env sh
+if [ "\$1 \$2 \$3" = "config get prefix" ]; then
+  printf '%s\n' "$active_prefix"
+  exit 0
+fi
+if [ "\$1" = "outdated" ]; then
+  printf '{}\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$tmpdir/fakenpm"
+  cat >"$tmpdir/config.env" <<EOF
+NVM_DIR="$tmpdir/nvm"
+NPM_CMD="$tmpdir/fakenpm"
+LOG_FILE="$tmpdir/history.log"
+EOF
+
+  preview_file="$tmpdir/preview.txt"
+  if run_pkg_maint "$preview_file" --migrate-nvm-from 2 --check --manager npm --config "$tmpdir/config.env"; then
+    preview_status=0
+  else
+    preview_status=$?
+  fi
+  preview=$(cat "$preview_file")
+
+  assert_status "$preview_status" 2 "explicit migration source preview reports available action"
+  assert_contains "$preview" "Source: v2" "source version accepts shorthand without v prefix"
+  assert_contains "$preview" "beta" "selected source package is previewed"
+
+  output_file="$tmpdir/output.txt"
+  if run_pkg_maint "$output_file" --migrate-nvm --yes --manager npm --config "$tmpdir/config.env"; then
+    status=0
+  else
+    status=$?
+  fi
+  output=$(cat "$output_file")
+
+  assert_status "$status" 1 "automatic migration rejects ambiguous sources"
+  assert_contains "$output" "Multiple inactive NVM environments" "ambiguous sources are listed"
+  assert_contains "$output" "require --migrate-nvm-from" "explicit selection guidance is shown"
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+}
+
 main() {
   test_help_and_syntax
   test_pip_npm_check_mode
@@ -440,6 +590,8 @@ main() {
   test_unavailable_manager_is_scan_failure
   test_uv_partial_scan_failure_propagates
   test_log_write_failure_is_visible
+  test_nvm_migration_preview_and_install
+  test_nvm_migration_yes_rejects_ambiguous_sources
   printf 'All regression tests passed.\n'
 }
 
