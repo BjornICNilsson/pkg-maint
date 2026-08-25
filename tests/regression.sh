@@ -86,11 +86,20 @@ fi
 exit 1
 EOF
 
-  chmod +x "$tmpdir/fakepip" "$tmpdir/fakenpm"
+  cat >"$tmpdir/fakeuv" <<'EOF'
+#!/usr/bin/env sh
+if [ "$1" = "tool" ] && [ "$2" = "list" ]; then
+  printf 'No tools installed\n'
+  exit 0
+fi
+exit 1
+EOF
+
+  chmod +x "$tmpdir/fakepip" "$tmpdir/fakenpm" "$tmpdir/fakeuv"
 
   cat >"$tmpdir/config.env" <<EOF
 PIP_CMD="$tmpdir/fakepip"
-UV_CMD="nonexistent-uv"
+UV_CMD="$tmpdir/fakeuv"
 NPM_CMD="$tmpdir/fakenpm"
 PIP_EXCLUDE="holdme"
 LOG_FILE="$tmpdir/history.log"
@@ -252,7 +261,171 @@ EOF
   assert_contains "$output" "uv/badtool" "failure details include the tool name"
 
   history_lines=$(wc -l <"$tmpdir/history.log" | tr -d ' ')
-  assert_status "$history_lines" 2 "history log records both uv install attempts"
+  assert_status "$history_lines" 5 "history log records run, scan, installs, and finish"
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+}
+
+test_npm_nvm_detection_verbose_and_run_logging() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pkg-maint-test-nvm.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  active_prefix="$tmpdir/nvm/versions/node/v2"
+  inactive_prefix="$tmpdir/nvm/versions/node/v1"
+  mkdir -p \
+    "$active_prefix/lib/node_modules/npm" \
+    "$inactive_prefix/lib/node_modules/npm" \
+    "$inactive_prefix/lib/node_modules/@openai/codex"
+
+  printf '{"name":"npm","version":"2.0.0"}\n' >"$active_prefix/lib/node_modules/npm/package.json"
+  printf '{"name":"npm","version":"1.0.0"}\n' >"$inactive_prefix/lib/node_modules/npm/package.json"
+  printf '{"name":"@openai/codex","version":"0.1.0"}\n' >"$inactive_prefix/lib/node_modules/@openai/codex/package.json"
+
+  cat >"$tmpdir/fakenpm" <<EOF
+#!/usr/bin/env sh
+if [ "\$1 \$2 \$3" = "config get prefix" ]; then
+  printf '%s\n' "$active_prefix"
+  exit 0
+fi
+if [ "\$1" = "outdated" ]; then
+  printf '{}\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$tmpdir/fakenpm"
+
+  cat >"$tmpdir/config.env" <<EOF
+NVM_DIR="$tmpdir/nvm"
+NPM_CMD="$tmpdir/fakenpm"
+LOG_FILE="$tmpdir/history.log"
+EOF
+
+  output_file="$tmpdir/output.txt"
+  if run_pkg_maint "$output_file" --check --manager npm --verbose --config "$tmpdir/config.env"; then
+    status=0
+  else
+    status=$?
+  fi
+  output=$(cat "$output_file")
+  history=$(cat "$tmpdir/history.log")
+
+  assert_status "$status" 0 "clean npm scan succeeds"
+  assert_contains "$output" "npm active prefix: $active_prefix (global packages=1)" "verbose output identifies active npm prefix"
+  assert_contains "$output" "inactive NVM prefix v1" "inactive NVM prefix is reported"
+  assert_contains "$output" "@openai/codex" "inactive package name is reported"
+  assert_contains "$output" "npm scan complete: packages=1 outdated=0" "verbose output includes npm scan count"
+  assert_contains "$output" "selected non-APT manager(s): npm" "no-update output states non-APT scope"
+  assert_contains "$history" "start mode=check manager=npm" "history records run start"
+  assert_contains "$history" "status=ok prefix=$active_prefix packages=1 outdated=0 inactive_nvm_prefixes=1" "history records npm scan context"
+  assert_contains "$history" "finish outcome=no-updates rc=0" "history records run completion"
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+}
+
+test_unavailable_manager_is_scan_failure() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pkg-maint-test-unavailable.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  cat >"$tmpdir/config.env" <<EOF
+PIP_CMD="pkg-maint-command-that-does-not-exist"
+LOG_FILE="$tmpdir/history.log"
+EOF
+
+  output_file="$tmpdir/output.txt"
+  if run_pkg_maint "$output_file" --check --manager pip --config "$tmpdir/config.env"; then
+    status=0
+  else
+    status=$?
+  fi
+  output=$(cat "$output_file")
+
+  assert_status "$status" 1 "unavailable selected manager fails the scan"
+  assert_contains "$output" "pip manager unavailable" "unavailable manager is reported"
+  assert_contains "$output" "no selected package managers are available" "unavailable-only scan does not claim a clean result"
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+}
+
+test_uv_partial_scan_failure_propagates() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pkg-maint-test-uvscanfail.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  mkdir -p "$tmpdir/tools/broken/bin"
+  cat >"$tmpdir/fakeuv" <<EOF
+#!/usr/bin/env sh
+if [ "\$1 \$2" = "tool list" ]; then
+  printf 'broken\n'
+  exit 0
+fi
+if [ "\$1 \$2" = "tool dir" ]; then
+  printf '%s\n' "$tmpdir/tools"
+  exit 0
+fi
+exit 1
+EOF
+  cat >"$tmpdir/tools/broken/bin/python" <<'EOF'
+#!/usr/bin/env sh
+printf 'registry unavailable\n' >&2
+exit 1
+EOF
+  chmod +x "$tmpdir/fakeuv" "$tmpdir/tools/broken/bin/python"
+
+  cat >"$tmpdir/config.env" <<EOF
+UV_CMD="$tmpdir/fakeuv"
+LOG_FILE="$tmpdir/history.log"
+EOF
+
+  output_file="$tmpdir/output.txt"
+  if run_pkg_maint "$output_file" --check --manager uv --verbose --config "$tmpdir/config.env"; then
+    status=0
+  else
+    status=$?
+  fi
+  output=$(cat "$output_file")
+
+  assert_status "$status" 1 "failed uv sub-scan propagates failure"
+  assert_contains "$output" "uv tool scan failed for broken" "failed uv tool is identified"
+  assert_contains "$output" "No updates confirmed" "failed uv sub-scan does not claim a clean result"
+
+  rm -rf "$tmpdir"
+  trap - EXIT INT TERM
+}
+
+test_log_write_failure_is_visible() {
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pkg-maint-test-logfail.XXXXXX")
+  trap 'rm -rf "$tmpdir"' EXIT INT TERM
+
+  printf 'not a directory\n' >"$tmpdir/notdir"
+  cat >"$tmpdir/fakenpm" <<'EOF'
+#!/usr/bin/env sh
+if [ "$1" = "outdated" ]; then
+  printf '{}\n'
+  exit 0
+fi
+exit 1
+EOF
+  chmod +x "$tmpdir/fakenpm"
+
+  cat >"$tmpdir/config.env" <<EOF
+NVM_DIR="$tmpdir/nvm"
+NPM_CMD="$tmpdir/fakenpm"
+LOG_FILE="$tmpdir/notdir/history.log"
+EOF
+
+  output_file="$tmpdir/output.txt"
+  if run_pkg_maint "$output_file" --check --manager npm --config "$tmpdir/config.env"; then
+    status=0
+  else
+    status=$?
+  fi
+  output=$(cat "$output_file")
+
+  assert_status "$status" 0 "log failure does not block a successful scan"
+  assert_contains "$output" "unable to write history log" "log write failure is visible"
 
   rm -rf "$tmpdir"
   trap - EXIT INT TERM
@@ -263,6 +436,10 @@ main() {
   test_pip_npm_check_mode
   test_uv_check_mode
   test_uv_install_failure
+  test_npm_nvm_detection_verbose_and_run_logging
+  test_unavailable_manager_is_scan_failure
+  test_uv_partial_scan_failure_propagates
+  test_log_write_failure_is_visible
   printf 'All regression tests passed.\n'
 }
 

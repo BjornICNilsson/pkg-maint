@@ -13,7 +13,10 @@ Linux-native updater for non-APT global packages (`pip` + `uv tool` + `npm`) wit
 - Supports non-interactive mode with `--yes`
 - Supports check-only mode with exit code `2` when updates are available
 - Supports package hold/exclude lists
-- Writes run history log with timestamps
+- Shows scan commands, active npm prefix, and package counts with `--verbose`
+- Warns when inactive NVM prefixes contain global packages missing from the active prefix
+- Logs run start, per-manager scan results, installs, failures, and run completion
+- Treats unavailable managers and partial scans as errors instead of reporting a clean result
 
 ## Files in this repo
 
@@ -80,6 +83,7 @@ pkg-maint
 pkg-maint --yes
 pkg-maint --manager pip --check
 pkg-maint --manager uv --check
+pkg-maint --manager npm --check --verbose
 pkg-maint --config /path/to/config.env --yes
 ```
 
@@ -98,7 +102,10 @@ LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/pkg-maint/history.log"
 ## Notes
 
 - Script scope is global package installs only (`pip`, `uv tool`, and global `npm`).
+- APT packages are not scanned or installed.
+- npm operations use only the active npm prefix. When NVM is present, inactive prefixes are inspected locally and reported if they contain package names absent from the active prefix; they are not modified.
 - If permissions are insufficient for a package install, the script records the failure and continues.
+- The tab-separated history log keeps six columns: timestamp, event/manager, subject/package, old version, new version, and result. Operational rows use `run` or `scan` in the second column.
 
 ## License
 

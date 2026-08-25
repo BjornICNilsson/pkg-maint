@@ -10,6 +10,26 @@ ASSUME_YES=0
 MANAGER="all"
 VERBOSE=0
 
+RUN_ID="$(date '+%Y%m%dT%H%M%S%z')-$$"
+RUN_STARTED=0
+LOG_WARNING_EMITTED=0
+
+PIP_OUTDATED_COUNT=0
+UV_TOOL_COUNT=0
+UV_OUTDATED_COUNT=0
+NPM_PACKAGE_COUNT="unknown"
+NPM_OUTDATED_COUNT=0
+NPM_ACTIVE_PREFIX="unknown"
+NVM_INACTIVE_PREFIX_COUNT=0
+
+total_count=0
+hold_count=0
+install_count=0
+runtime_error=0
+updated_count=0
+failed_count=0
+RUN_OUTCOME="started"
+
 DEFAULT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/pkg-maint/config.env"
 CONFIG_FILE="$DEFAULT_CONFIG"
 
@@ -30,13 +50,26 @@ Options:
   --yes                   Install without confirmation prompt
   --manager <pip|uv|npm|all>  Limit scope to one manager (default: all)
   --config <path>         Use a custom config file
-  --verbose               Print command output during installs
+  --verbose               Print scan details and install command output
   -h, --help              Show this help
 USAGE
 }
 
 warn() {
   printf '%s: %s\n' "$PROGRAM" "$*" >&2
+}
+
+verbose() {
+  if [ "$VERBOSE" -eq 1 ]; then
+    printf '%s: %s\n' "$PROGRAM" "$*" >&2
+  fi
+}
+
+verbose_file() {
+  file=$1
+  if [ "$VERBOSE" -eq 1 ] && [ -s "$file" ]; then
+    sed 's/^/  /' "$file" >&2
+  fi
 }
 
 die() {
@@ -63,7 +96,14 @@ is_excluded() {
 
 ensure_log_dir() {
   log_dir=$(dirname "$LOG_FILE")
-  mkdir -p "$log_dir" 2>/dev/null || true
+  mkdir -p "$log_dir" 2>/dev/null
+}
+
+log_warning() {
+  if [ "$LOG_WARNING_EMITTED" -eq 0 ]; then
+    warn "unable to write history log: $LOG_FILE"
+    LOG_WARNING_EMITTED=1
+  fi
 }
 
 log_result() {
@@ -73,14 +113,31 @@ log_result() {
   new_version=$4
   result=$5
 
-  ensure_log_dir
-  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+  if ! ensure_log_dir; then
+    log_warning
+    return 1
+  fi
+
+  if ! printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
     "$manager_name" \
     "$package_name" \
     "$old_version" \
     "$new_version" \
-    "$result" >>"$LOG_FILE" 2>/dev/null || true
+    "$result" >>"$LOG_FILE" 2>/dev/null
+  then
+    log_warning
+    return 1
+  fi
+
+  return 0
+}
+
+log_event() {
+  event_type=$1
+  event_subject=$2
+  event_result=$3
+  log_result "$event_type" "$event_subject" "-" "-" "$event_result" || true
 }
 
 pip_list_outdated() {
@@ -107,6 +164,110 @@ npm_install_pkg() {
   # shellcheck disable=SC2086
   set -- $NPM_CMD
   "$@" install -g "${package_name}@latest"
+}
+
+npm_active_prefix() {
+  # shellcheck disable=SC2086
+  set -- $NPM_CMD
+  "$@" config get prefix
+}
+
+inspect_npm_environment() {
+  npm_prefix_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-prefix-err.XXXXXX") || return 0
+  npm_environment=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-environment.XXXXXX") || {
+    rm -f "$npm_prefix_err"
+    return 0
+  }
+
+  if NPM_ACTIVE_PREFIX=$(npm_active_prefix 2>"$npm_prefix_err"); then
+    NPM_ACTIVE_PREFIX=$(printf '%s\n' "$NPM_ACTIVE_PREFIX" | tail -n 1)
+  else
+    NPM_ACTIVE_PREFIX="unknown"
+    verbose "unable to determine active npm prefix"
+    verbose_file "$npm_prefix_err"
+    rm -f "$npm_prefix_err" "$npm_environment"
+    return 0
+  fi
+
+  nvm_root=${NVM_DIR:-$HOME/.nvm}
+  if ! python3 - "$NPM_ACTIVE_PREFIX" "$nvm_root" >"$npm_environment" <<'PY'
+import json
+import pathlib
+import sys
+
+active_prefix = pathlib.Path(sys.argv[1]).expanduser()
+nvm_root = pathlib.Path(sys.argv[2]).expanduser()
+
+
+def package_names(prefix):
+    root = prefix / "lib" / "node_modules"
+    names = set()
+    if not root.is_dir():
+        return names
+    for entry in root.iterdir():
+        if entry.name.startswith("@") and entry.is_dir():
+            candidates = entry.iterdir()
+        else:
+            candidates = (entry,)
+        for candidate in candidates:
+            package_json = candidate / "package.json"
+            if not package_json.is_file():
+                continue
+            try:
+                data = json.loads(package_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            name = data.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
+    return names
+
+
+active_names = package_names(active_prefix)
+print(f"ACTIVE\t{len(active_names)}")
+
+versions_dir = nvm_root / "versions" / "node"
+try:
+    active_resolved = active_prefix.resolve()
+except OSError:
+    active_resolved = active_prefix
+
+if versions_dir.is_dir():
+    for prefix in sorted(versions_dir.iterdir()):
+        if not prefix.is_dir():
+            continue
+        try:
+            if prefix.resolve() == active_resolved:
+                continue
+        except OSError:
+            if prefix == active_prefix:
+                continue
+        extra_names = sorted(package_names(prefix) - active_names)
+        if extra_names:
+            print(f"INACTIVE\t{prefix.name}\t{','.join(extra_names)}")
+PY
+  then
+    verbose "unable to inspect npm/NVM package directories"
+    rm -f "$npm_prefix_err" "$npm_environment"
+    return 0
+  fi
+
+  while IFS="$TAB" read -r record_type record_value record_packages; do
+    case "$record_type" in
+      ACTIVE)
+        NPM_PACKAGE_COUNT=${record_value:-unknown}
+        ;;
+      INACTIVE)
+        NVM_INACTIVE_PREFIX_COUNT=$((NVM_INACTIVE_PREFIX_COUNT + 1))
+        warn "inactive NVM prefix $record_value contains packages absent from active prefix: $record_packages"
+        log_event "scan" "npm" "run=$RUN_ID inactive_nvm_prefix=$record_value packages=$record_packages"
+        ;;
+    esac
+  done <"$npm_environment"
+
+  verbose "npm active prefix: $NPM_ACTIVE_PREFIX (global packages=$NPM_PACKAGE_COUNT)"
+  verbose_file "$npm_prefix_err"
+  rm -f "$npm_prefix_err" "$npm_environment"
 }
 
 uv_list_tools() {
@@ -160,13 +321,17 @@ collect_pip_updates() {
     return 1
   }
 
+  verbose "scanning pip: $PIP_CMD list --outdated --format=json"
   if ! pip_list_outdated >"$pip_json" 2>"$pip_err"; then
     warn "pip scan failed: $(tail -n 1 "$pip_err" 2>/dev/null)"
+    verbose_file "$pip_err"
     rm -f "$pip_json" "$pip_err" "$pip_parsed"
     return 1
   fi
 
   if [ ! -s "$pip_json" ]; then
+    verbose "pip scan complete: outdated=0"
+    verbose_file "$pip_err"
     rm -f "$pip_json" "$pip_err" "$pip_parsed"
     return 0
   fi
@@ -190,9 +355,14 @@ for item in items:
 PY
   then
     warn "failed to parse pip update output"
+    verbose_file "$pip_err"
     rm -f "$pip_json" "$pip_err" "$pip_parsed"
     return 1
   fi
+
+  PIP_OUTDATED_COUNT=$(wc -l <"$pip_parsed" | tr -d ' ')
+  verbose "pip scan complete: outdated=$PIP_OUTDATED_COUNT"
+  verbose_file "$pip_err"
 
   while IFS="$TAB" read -r package_name current_version latest_version; do
     [ -n "${package_name:-}" ] || continue
@@ -221,13 +391,18 @@ collect_uv_updates() {
     return 1
   }
 
+  uv_scan_failed=0
+  verbose "scanning uv tools: $UV_CMD tool list"
   if ! uv_list_tools >"$uv_list_file" 2>"$uv_err"; then
     warn "uv scan failed: $(tail -n 1 "$uv_err" 2>/dev/null)"
+    verbose_file "$uv_err"
     rm -f "$uv_list_file" "$uv_err"
     return 1
   fi
 
   if grep -Fxq "No tools installed" "$uv_list_file"; then
+    verbose "uv scan complete: tools=0 outdated=0"
+    verbose_file "$uv_err"
     rm -f "$uv_list_file" "$uv_err"
     return 0
   fi
@@ -236,6 +411,7 @@ collect_uv_updates() {
     :
   else
     warn "uv scan failed: $(tail -n 1 "$uv_err" 2>/dev/null)"
+    verbose_file "$uv_err"
     rm -f "$uv_list_file" "$uv_err"
     return 1
   fi
@@ -251,26 +427,39 @@ collect_uv_updates() {
     tool_name=${1:-}
     tool_name=${tool_name%:}
     [ -n "$tool_name" ] || continue
+    UV_TOOL_COUNT=$((UV_TOOL_COUNT + 1))
 
     tool_python="$uv_root/$tool_name/bin/python"
     if [ ! -x "$tool_python" ]; then
       warn "uv tool environment missing python: $tool_name"
+      uv_scan_failed=1
       continue
     fi
 
-    uv_tool_json=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool.XXXXXX") || continue
+    uv_tool_json=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool.XXXXXX") || {
+      warn "unable to create uv scan temp file for $tool_name"
+      uv_scan_failed=1
+      continue
+    }
     uv_tool_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool-err.XXXXXX") || {
       rm -f "$uv_tool_json"
+      warn "unable to create uv error temp file for $tool_name"
+      uv_scan_failed=1
       continue
     }
     uv_tool_parsed=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-uv-tool-parsed.XXXXXX") || {
       rm -f "$uv_tool_json" "$uv_tool_err"
+      warn "unable to create uv parse temp file for $tool_name"
+      uv_scan_failed=1
       continue
     }
 
+    verbose "scanning uv tool: $tool_name"
     if ! "$tool_python" -m pip list --outdated --format=json >"$uv_tool_json" 2>"$uv_tool_err"; then
       warn "uv tool scan failed for $tool_name: $(tail -n 1 "$uv_tool_err" 2>/dev/null)"
+      verbose_file "$uv_tool_err"
       rm -f "$uv_tool_json" "$uv_tool_err" "$uv_tool_parsed"
+      uv_scan_failed=1
       continue
     fi
 
@@ -301,11 +490,15 @@ for item in items:
 PY
     then
       warn "failed to parse uv tool output for $tool_name"
+      verbose_file "$uv_tool_err"
       rm -f "$uv_tool_json" "$uv_tool_err" "$uv_tool_parsed"
+      uv_scan_failed=1
       continue
     fi
 
     if [ -s "$uv_tool_parsed" ]; then
+      uv_tool_outdated_count=$(wc -l <"$uv_tool_parsed" | tr -d ' ')
+      UV_OUTDATED_COUNT=$((UV_OUTDATED_COUNT + uv_tool_outdated_count))
       while IFS="$TAB" read -r package_name current_version latest_version; do
         [ -n "${package_name:-}" ] || continue
 
@@ -318,10 +511,17 @@ PY
       done <"$uv_tool_parsed"
     fi
 
+    verbose_file "$uv_tool_err"
+
     rm -f "$uv_tool_json" "$uv_tool_err" "$uv_tool_parsed"
   done <"$uv_list_file"
 
+  verbose "uv scan complete: tools=$UV_TOOL_COUNT outdated=$UV_OUTDATED_COUNT"
+  verbose_file "$uv_err"
   rm -f "$uv_list_file" "$uv_err"
+  if [ "$uv_scan_failed" -eq 1 ]; then
+    return 1
+  fi
   return 0
 }
 
@@ -330,6 +530,8 @@ collect_npm_updates() {
     warn "python3 is required to parse npm update output"
     return 1
   fi
+
+  inspect_npm_environment
 
   npm_json=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm.XXXXXX") || return 1
   npm_err=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-npm-err.XXXXXX") || {
@@ -341,6 +543,7 @@ collect_npm_updates() {
     return 1
   }
 
+  verbose "scanning npm: $NPM_CMD outdated -g --json"
   if npm_list_outdated >"$npm_json" 2>"$npm_err"; then
     npm_status=0
   else
@@ -349,11 +552,14 @@ collect_npm_updates() {
 
   if [ "$npm_status" -gt 1 ]; then
     warn "npm scan failed: $(tail -n 1 "$npm_err" 2>/dev/null)"
+    verbose_file "$npm_err"
     rm -f "$npm_json" "$npm_err" "$npm_parsed"
     return 1
   fi
 
   if [ ! -s "$npm_json" ]; then
+    verbose "npm scan complete: packages=$NPM_PACKAGE_COUNT outdated=0"
+    verbose_file "$npm_err"
     rm -f "$npm_json" "$npm_err" "$npm_parsed"
     return 0
   fi
@@ -379,9 +585,14 @@ for name, meta in obj.items():
 PY
   then
     warn "failed to parse npm update output"
+    verbose_file "$npm_err"
     rm -f "$npm_json" "$npm_err" "$npm_parsed"
     return 1
   fi
+
+  NPM_OUTDATED_COUNT=$(wc -l <"$npm_parsed" | tr -d ' ')
+  verbose "npm scan complete: packages=$NPM_PACKAGE_COUNT outdated=$NPM_OUTDATED_COUNT"
+  verbose_file "$npm_err"
 
   while IFS="$TAB" read -r package_name current_version latest_version; do
     [ -n "${package_name:-}" ] || continue
@@ -452,14 +663,39 @@ if [ -f "$CONFIG_FILE" ]; then
   . "$CONFIG_FILE"
 fi
 
+ALL_UPDATES_FILE=""
+TO_INSTALL_FILE=""
+FAILURES_FILE=""
+
+cleanup() {
+  [ -n "$ALL_UPDATES_FILE" ] && rm -f "$ALL_UPDATES_FILE"
+  [ -n "$TO_INSTALL_FILE" ] && rm -f "$TO_INSTALL_FILE"
+  [ -n "$FAILURES_FILE" ] && rm -f "$FAILURES_FILE"
+}
+
+finalize_run() {
+  final_rc=$?
+  trap - EXIT
+  if [ "$RUN_STARTED" -eq 1 ]; then
+    log_event "run" "$RUN_ID" "finish outcome=$RUN_OUTCOME rc=$final_rc manager=$MANAGER found=$total_count updatable=$install_count held=$hold_count updated=$updated_count failed=$failed_count scan_errors=$runtime_error"
+  fi
+  cleanup
+  exit "$final_rc"
+}
+
+trap finalize_run EXIT
+trap 'RUN_OUTCOME="interrupted"; exit 130' INT TERM
+
+run_mode="install"
+if [ "$CHECK_ONLY" -eq 1 ]; then
+  run_mode="check"
+fi
+RUN_STARTED=1
+log_event "run" "$RUN_ID" "start mode=$run_mode manager=$MANAGER"
+
 ALL_UPDATES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-all.XXXXXX") || die "unable to create temp file"
 TO_INSTALL_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-install.XXXXXX") || die "unable to create temp file"
 FAILURES_FILE=$(mktemp "${TMPDIR:-/tmp}/pkg-maint-failures.XXXXXX") || die "unable to create temp file"
-
-cleanup() {
-  rm -f "$ALL_UPDATES_FILE" "$TO_INSTALL_FILE" "$FAILURES_FILE"
-}
-trap cleanup EXIT INT TERM
 
 want_pip=0
 want_uv=0
@@ -488,11 +724,16 @@ if [ "$want_pip" -eq 1 ]; then
   pip_bin=$(first_word "$PIP_CMD" || true)
   if [ -n "$pip_bin" ] && command -v "$pip_bin" >/dev/null 2>&1; then
     available_managers=$((available_managers + 1))
-    if ! collect_pip_updates; then
+    if collect_pip_updates; then
+      log_event "scan" "pip" "run=$RUN_ID status=ok outdated=$PIP_OUTDATED_COUNT"
+    else
       runtime_error=1
+      log_event "scan" "pip" "run=$RUN_ID status=failed outdated=$PIP_OUTDATED_COUNT"
     fi
   else
     warn "pip manager unavailable (missing command: $pip_bin)"
+    runtime_error=1
+    log_event "scan" "pip" "run=$RUN_ID status=unavailable command=$pip_bin"
   fi
 fi
 
@@ -500,11 +741,16 @@ if [ "$want_uv" -eq 1 ]; then
   uv_bin=$(first_word "$UV_CMD" || true)
   if [ -n "$uv_bin" ] && command -v "$uv_bin" >/dev/null 2>&1; then
     available_managers=$((available_managers + 1))
-    if ! collect_uv_updates; then
+    if collect_uv_updates; then
+      log_event "scan" "uv" "run=$RUN_ID status=ok tools=$UV_TOOL_COUNT outdated=$UV_OUTDATED_COUNT"
+    else
       runtime_error=1
+      log_event "scan" "uv" "run=$RUN_ID status=failed tools=$UV_TOOL_COUNT outdated=$UV_OUTDATED_COUNT"
     fi
   else
     warn "uv manager unavailable (missing command: $uv_bin)"
+    runtime_error=1
+    log_event "scan" "uv" "run=$RUN_ID status=unavailable command=$uv_bin"
   fi
 fi
 
@@ -512,15 +758,21 @@ if [ "$want_npm" -eq 1 ]; then
   npm_bin=$(first_word "$NPM_CMD" || true)
   if [ -n "$npm_bin" ] && command -v "$npm_bin" >/dev/null 2>&1; then
     available_managers=$((available_managers + 1))
-    if ! collect_npm_updates; then
+    if collect_npm_updates; then
+      log_event "scan" "npm" "run=$RUN_ID status=ok prefix=$NPM_ACTIVE_PREFIX packages=$NPM_PACKAGE_COUNT outdated=$NPM_OUTDATED_COUNT inactive_nvm_prefixes=$NVM_INACTIVE_PREFIX_COUNT"
+    else
       runtime_error=1
+      log_event "scan" "npm" "run=$RUN_ID status=failed prefix=$NPM_ACTIVE_PREFIX packages=$NPM_PACKAGE_COUNT outdated=$NPM_OUTDATED_COUNT"
     fi
   else
     warn "npm manager unavailable (missing command: $npm_bin)"
+    runtime_error=1
+    log_event "scan" "npm" "run=$RUN_ID status=unavailable command=$npm_bin"
   fi
 fi
 
 if [ "$available_managers" -eq 0 ]; then
+  RUN_OUTCOME="scan-failed"
   die "no selected package managers are available"
 fi
 
@@ -529,32 +781,40 @@ hold_count=$(awk -F '\t' '$5 == "held" { c += 1 } END { print c + 0 }' "$ALL_UPD
 install_count=$(wc -l <"$TO_INSTALL_FILE" | tr -d ' ')
 
 if [ "$total_count" -eq 0 ]; then
-  printf 'No updates found for selected manager(s).\n'
   if [ "$runtime_error" -eq 1 ]; then
+    RUN_OUTCOME="scan-failed"
+    printf 'No updates confirmed because one or more selected scans failed.\n'
     exit 1
   fi
+  RUN_OUTCOME="no-updates"
+  printf 'No updates found for selected non-APT manager(s): %s.\n' "$MANAGER"
   exit 0
 fi
 
 print_table
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
-  printf '\nSummary: scanned=%s updatable=%s held=%s\n' "$total_count" "$install_count" "$hold_count"
+  printf '\nSummary: found=%s updatable=%s held=%s scan_errors=%s\n' "$total_count" "$install_count" "$hold_count" "$runtime_error"
 
   if [ "$runtime_error" -eq 1 ]; then
+    RUN_OUTCOME="partial-scan"
     exit 1
   fi
   if [ "$install_count" -gt 0 ]; then
+    RUN_OUTCOME="updates-available"
     exit 2
   fi
+  RUN_OUTCOME="all-held"
   exit 0
 fi
 
 if [ "$install_count" -eq 0 ]; then
   printf '\nNo installable updates (all updates are held).\n'
   if [ "$runtime_error" -eq 1 ]; then
+    RUN_OUTCOME="partial-scan"
     exit 1
   fi
+  RUN_OUTCOME="all-held"
   exit 0
 fi
 
@@ -566,13 +826,11 @@ if [ "$ASSUME_YES" -ne 1 ]; then
       ;;
     *)
       printf 'Aborted.\n'
+      RUN_OUTCOME="aborted"
       exit 0
       ;;
   esac
 fi
-
-updated_count=0
-failed_count=0
 
 while IFS="$TAB" read -r manager_name package_name current_version latest_version action; do
   [ "$action" = "update" ] || continue
@@ -607,7 +865,7 @@ while IFS="$TAB" read -r manager_name package_name current_version latest_versio
 
   if [ "$rc" -eq 0 ]; then
     updated_count=$((updated_count + 1))
-    log_result "$manager_name" "$package_name" "$current_version" "$latest_version" "ok"
+    log_result "$manager_name" "$package_name" "$current_version" "$latest_version" "ok run=$RUN_ID"
     if [ "$VERBOSE" -eq 1 ]; then
       sed 's/^/  /' "$install_log"
     fi
@@ -626,14 +884,14 @@ while IFS="$TAB" read -r manager_name package_name current_version latest_versio
     printf '%s\t%s\t%s\t%s\t%s\n' \
       "$manager_name" "$package_name" "$current_version" "$latest_version" "$failure_reason" >>"$FAILURES_FILE"
 
-    log_result "$manager_name" "$package_name" "$current_version" "$latest_version" "failed:$failure_reason"
+    log_result "$manager_name" "$package_name" "$current_version" "$latest_version" "failed:$failure_reason run=$RUN_ID"
   fi
 
   rm -f "$install_log"
 done <"$TO_INSTALL_FILE"
 
-printf '\nSummary: scanned=%s updatable=%s held=%s updated=%s failed=%s\n' \
-  "$total_count" "$install_count" "$hold_count" "$updated_count" "$failed_count"
+printf '\nSummary: found=%s updatable=%s held=%s updated=%s failed=%s scan_errors=%s\n' \
+  "$total_count" "$install_count" "$hold_count" "$updated_count" "$failed_count" "$runtime_error"
 
 if [ "$failed_count" -gt 0 ]; then
   printf 'Failures:\n'
@@ -644,7 +902,9 @@ if [ "$failed_count" -gt 0 ]; then
 fi
 
 if [ "$runtime_error" -eq 1 ] || [ "$failed_count" -gt 0 ]; then
+  RUN_OUTCOME="failed"
   exit 1
 fi
 
+RUN_OUTCOME="completed"
 exit 0
