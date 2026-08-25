@@ -6,6 +6,8 @@ pkg-maint \- update global pip, uv tool, and npm packages with an interactive Li
 .RI [ --check ]
 .RI [ --yes ]
 .RI [ --manager " pip|uv|npm|all" ]
+.RI [ --migrate-nvm ]
+.RI [ --migrate-nvm-from " version" ]
 .RI [ --config " path" ]
 .RI [ --verbose ]
 .SH DESCRIPTION
@@ -14,7 +16,7 @@ lists available updates for global pip, uv tool, and npm packages, then asks for
 It supports a non-interactive mode with
 .BR --yes .
 APT packages are outside its scope.
-For npm, only the active npm prefix is scanned. Inactive NVM prefixes containing additional package names are reported but not modified.
+For npm, only the active npm prefix is scanned. Inactive NVM prefixes containing additional package names are reported and are modified only after an explicit migration request is confirmed.
 .SH OPTIONS
 .TP
 .B --check
@@ -27,6 +29,17 @@ Skip confirmation prompt and install updates directly.
 .BI "--manager " pip|uv|npm|all
 Limit operations to a specific manager. Default is
 .B all.
+.TP
+.B --migrate-nvm
+Discover inactive NVM versions and migrate global packages that are absent from the active npm prefix.
+With
+.BR --check ,
+show a non-mutating preview and return exit code 2 when migration is available.
+.TP
+.BI "--migrate-nvm-from " version
+Use a specific inactive NVM source version. The leading
+.B v
+is optional.
 .TP
 .BI "--config " path
 Load a specific config file. Default is
@@ -73,6 +86,12 @@ Configuration file variables:
 2: updates available in
 .B --check
 mode
+.PP
+Exit code 2 is also returned when
+.B --migrate-nvm --check
+finds packages available for migration.
+.SH NVM MIGRATION
+Migration targets the active NVM-managed npm prefix. Only package names absent from the target are installed, using their exact source versions. Existing target packages are not downgraded, the source NVM environment is retained, and linked global packages stop migration before changes are made.
 .SH FILES
 .IP \[bu] 2
 .I ~/.config/pkg-maint/config.env
